@@ -38,6 +38,12 @@
 #define TEST_MODE
 #define TEST_FREQ_HZ_DEFAULT    3500U   // Frequência de teste inicial em Hz (1800–5450)
 
+// ---- Modo de teste CAN: loopback interno (sem transceiver externo) ----
+// Descomente CAN_LOOPBACK_TEST para o FDCAN conectar TX→RX internamente.
+// O MCU transmite e recebe seus próprios frames; monitore can_rx_count e
+// can_loopback_ok via Live Expressions para confirmar que o periférico funciona.
+#define CAN_LOOPBACK_TEST
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -56,6 +62,24 @@ DMA_HandleTypeDef hdma_tim2_ch4;
 DMA_HandleTypeDef hdma_tim3_ch4;
 
 /* USER CODE BEGIN PV */
+
+FDCAN_HandleTypeDef hfdcan1;
+
+#ifdef CAN_LOOPBACK_TEST
+// --- Diagnóstico de loopback CAN (Live Expressions) ---
+// can_loopback_ok  : 1 = pelo menos 1 frame foi recebido de volta
+// can_rx_count     : total de frames recebidos via loopback
+// can_tx_errors    : nº de falhas em HAL_FDCAN_AddMessageToTxFifoQ
+// can_error_code   : hfdcan1.ErrorCode — qualquer flag != 0 indica falha HAL
+// can_rxf0s        : registrador RXF0S raw (bits[2:0] = nº de frames no FIFO0)
+// can_txfqs        : registrador TXFQS raw (bits[4:0] = espaço livre no TX FIFO)
+volatile uint32_t can_rx_count    = 0;
+volatile uint8_t  can_loopback_ok = 0;
+volatile uint32_t can_tx_errors   = 0;
+volatile uint32_t can_error_code  = 0;
+volatile uint32_t can_rxf0s       = 0;
+volatile uint32_t can_txfqs       = 0;
+#endif
 
 #ifdef TEST_MODE
 TIM_HandleTypeDef htim4_test;       // Handle do timer gerador de teste
@@ -105,6 +129,11 @@ static float map_float(float x, float in_min, float in_max, float out_min, float
 static float freq_para_tensao(float freq);
 static float tensao_para_temp(float v);
 static void processar_canal(int idx, volatile uint32_t *capture);
+static void MX_FDCAN1_Init(void);
+static HAL_StatusTypeDef send_address_claim(void);
+static HAL_StatusTypeDef send_thermistor_summary(int8_t minT, int8_t maxT, int8_t avgT,
+                                                  uint8_t count, uint8_t id_max, uint8_t id_min);
+static HAL_StatusTypeDef send_all_temps_to_esp(int8_t temps[NUM_SENSORS]);
 #ifdef TEST_MODE
 static void test_pwm_start(uint32_t freq_hz);
 static void test_pwm_update(uint32_t freq_hz);
@@ -217,6 +246,161 @@ static void test_pwm_update(uint32_t freq_hz)
 }
 #endif
 
+// Inicializa FDCAN1 em 500 kbps (Classic CAN) nos pinos PB8=RX, PB9=TX (AF9).
+// Bit timing @ 64 MHz: Prescaler=8, Seg1=12, Seg2=3 → 16 tq × 125 ns = 2 µs = 500 kbps.
+static void MX_FDCAN1_Init(void)
+{
+    __HAL_RCC_FDCAN_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    // Seleciona PCLK1 (64 MHz) como clock kernel do FDCAN.
+    // O reset default é HSE (0x0), que não está habilitado neste projeto (HSI+PLL).
+    // Sem isso, o FDCAN não tem clock de bit timing → TX FIFO trava cheio.
+    __HAL_RCC_FDCAN_CONFIG(RCC_FDCANCLKSOURCE_PCLK1);
+
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin       = GPIO_PIN_8 | GPIO_PIN_9;   // PB8=RX, PB9=TX
+    gpio.Mode      = GPIO_MODE_AF_PP;
+    gpio.Pull      = GPIO_NOPULL;
+    gpio.Speed     = GPIO_SPEED_FREQ_HIGH;
+    gpio.Alternate = GPIO_AF9_FDCAN1;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    hfdcan1.Instance                  = FDCAN1;
+    hfdcan1.Init.ClockDivider         = FDCAN_CLOCK_DIV1;
+    hfdcan1.Init.FrameFormat          = FDCAN_FRAME_CLASSIC;
+    // CAN_LOOPBACK_TEST: TX→RX internamente, sem transceiver nem barramento externo.
+    // Normal: barramento físico nos pinos PB8(RX)/PB9(TX).
+#ifdef CAN_LOOPBACK_TEST
+    // External Loopback: TX opera normalmente (bits dominantes OK) + TX conectado
+    // internamente ao RX. Internal Loopback (MON=1) trava TX FIFO — não usar.
+    hfdcan1.Init.Mode                 = FDCAN_MODE_EXTERNAL_LOOPBACK;
+#else
+    hfdcan1.Init.Mode                 = FDCAN_MODE_NORMAL;
+#endif
+    hfdcan1.Init.AutoRetransmission   = DISABLE;
+    hfdcan1.Init.TransmitPause        = DISABLE;
+    hfdcan1.Init.ProtocolException    = DISABLE;
+    hfdcan1.Init.NominalPrescaler     = 8;
+    hfdcan1.Init.NominalSyncJumpWidth = 3;
+    hfdcan1.Init.NominalTimeSeg1      = 12;
+    hfdcan1.Init.NominalTimeSeg2      = 3;
+    hfdcan1.Init.DataPrescaler        = 1;
+    hfdcan1.Init.DataSyncJumpWidth    = 1;
+    hfdcan1.Init.DataTimeSeg1         = 1;
+    hfdcan1.Init.DataTimeSeg2         = 1;
+#ifdef CAN_LOOPBACK_TEST
+    hfdcan1.Init.StdFiltersNbr        = 1;   // aceita standard IDs (0x350)
+    hfdcan1.Init.ExtFiltersNbr        = 1;   // aceita extended IDs (0x1839F380)
+#else
+    hfdcan1.Init.StdFiltersNbr        = 0;
+    hfdcan1.Init.ExtFiltersNbr        = 0;
+#endif
+    hfdcan1.Init.TxFifoQueueMode      = FDCAN_TX_FIFO_OPERATION;
+    if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+#ifdef CAN_LOOPBACK_TEST
+    // Filtro extended (máscara 0 = aceita qualquer 29-bit ID) → FIFO0
+    FDCAN_FilterTypeDef sf = {0};
+    sf.IdType       = FDCAN_EXTENDED_ID;
+    sf.FilterIndex  = 0;
+    sf.FilterType   = FDCAN_FILTER_MASK;
+    sf.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+    sf.FilterID1    = 0x00000000U;
+    sf.FilterID2    = 0x00000000U;
+    if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sf) != HAL_OK) { Error_Handler(); }
+
+    // Filtro standard (máscara 0 = aceita qualquer 11-bit ID) → FIFO0
+    sf.IdType       = FDCAN_STANDARD_ID;
+    sf.FilterIndex  = 0;
+    sf.FilterID1    = 0x000U;
+    sf.FilterID2    = 0x000U;
+    if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sf) != HAL_OK) { Error_Handler(); }
+
+    // Frames sem filtro também vão para FIFO0
+    HAL_FDCAN_ConfigGlobalFilter(&hfdcan1,
+        FDCAN_ACCEPT_IN_RX_FIFO0, FDCAN_ACCEPT_IN_RX_FIFO0,
+        FDCAN_FILTER_REMOTE,      FDCAN_FILTER_REMOTE);
+#endif
+}
+
+// Envia Address Claim J1939 (CAN ID 0x18EEFF80, 200 ms conforme protocolo Orion TEM).
+// Source Address 0x80 = módulo #0; alterar o último byte do ID para múltiplos módulos.
+static HAL_StatusTypeDef send_address_claim(void)
+{
+    FDCAN_TxHeaderTypeDef txh = {0};
+    uint8_t data[8] = {0xF3, 0x00, 0x80, 0x00, 0x40, 0x1E, 0x90, 0x00};
+
+    txh.Identifier         = 0x18EEFF80U;
+    txh.IdType             = FDCAN_EXTENDED_ID;
+    txh.TxFrameType        = FDCAN_DATA_FRAME;
+    txh.DataLength         = FDCAN_DLC_BYTES_8;
+    txh.ErrorStateIndicator= FDCAN_ESI_ACTIVE;
+    txh.BitRateSwitch      = FDCAN_BRS_OFF;
+    txh.FDFormat           = FDCAN_CLASSIC_CAN;
+    txh.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+    txh.MessageMarker      = 0;
+    return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txh, data);
+}
+
+// Envia resumo de temperatura ao Orion BMS (CAN ID 0x1839F380, 100 ms).
+// Payload: [reservado, minT, maxT, avgT, count, id_max, id_min, checksum].
+// Checksum = (0x39 + 8 + soma dos 7 bytes anteriores) & 0xFF.
+static HAL_StatusTypeDef send_thermistor_summary(int8_t minT, int8_t maxT, int8_t avgT,
+                                                  uint8_t count, uint8_t id_max, uint8_t id_min)
+{
+    FDCAN_TxHeaderTypeDef txh = {0};
+    uint8_t data[8];
+
+    data[0] = 0;
+    data[1] = (uint8_t)minT;
+    data[2] = (uint8_t)maxT;
+    data[3] = (uint8_t)avgT;
+    data[4] = count;
+    data[5] = id_max;
+    data[6] = id_min;
+
+    uint16_t cksum = 0x39U + 8U;
+    for (int i = 0; i < 7; i++) cksum += data[i];
+    data[7] = (uint8_t)(cksum & 0xFFU);
+
+    txh.Identifier         = 0x1839F380U;
+    txh.IdType             = FDCAN_EXTENDED_ID;
+    txh.TxFrameType        = FDCAN_DATA_FRAME;
+    txh.DataLength         = FDCAN_DLC_BYTES_8;
+    txh.ErrorStateIndicator= FDCAN_ESI_ACTIVE;
+    txh.BitRateSwitch      = FDCAN_BRS_OFF;
+    txh.FDFormat           = FDCAN_CLASSIC_CAN;
+    txh.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+    txh.MessageMarker      = 0;
+    return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txh, data);
+}
+
+// Envia os 5 valores de temperatura ao ESP (CAN ID 0x350, standard 11-bit).
+// Bytes 0–4 = temperaturas dos segmentos 1–5 (int8_t); bytes 5–7 = 0.
+static HAL_StatusTypeDef send_all_temps_to_esp(int8_t temps[NUM_SENSORS])
+{
+    FDCAN_TxHeaderTypeDef txh = {0};
+    uint8_t data[8] = {0};
+
+    for (int i = 0; i < NUM_SENSORS; i++)
+        data[i] = (uint8_t)temps[i];
+
+    txh.Identifier         = 0x350U;
+    txh.IdType             = FDCAN_STANDARD_ID;
+    txh.TxFrameType        = FDCAN_DATA_FRAME;
+    txh.DataLength         = FDCAN_DLC_BYTES_8;
+    txh.ErrorStateIndicator= FDCAN_ESI_ACTIVE;
+    txh.BitRateSwitch      = FDCAN_BRS_OFF;
+    txh.FDFormat           = FDCAN_CLASSIC_CAN;
+    txh.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+    txh.MessageMarker      = 0;
+    return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txh, data);
+}
+
 // Redireciona printf para SWO/ITM (Serial Wire Viewer)
 int _write(int file, char *ptr, int len)
 {
@@ -263,6 +447,10 @@ int main(void)
   MX_TIM2_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
+
+  MX_FDCAN1_Init();
+  HAL_FDCAN_Start(&hfdcan1);
+  (void)send_address_claim();   // Address Claim inicial ao energizar
 
 #ifdef TEST_MODE
   test_pwm_start(test_freq_hz);
@@ -315,6 +503,54 @@ int main(void)
     processar_canal(2, in_capture_3);
     processar_canal(3, in_capture_4);
     processar_canal(4, in_capture_5);
+
+    // Calcula estatísticas e envia via CAN
+    {
+        int8_t temps_i8[NUM_SENSORS];
+        int8_t minT = 127, maxT = -128;
+        uint8_t id_min = 0, id_max = 0;
+        float soma = 0.0f;
+
+        for (int i = 0; i < NUM_SENSORS; i++)
+        {
+            float t = Temperaturas[i];
+            int8_t ti = (t > 127.0f) ? 127 : (t < -128.0f) ? -128 : (int8_t)t;
+            temps_i8[i] = ti;
+            soma += t;
+            if (ti < minT) { minT = ti; id_min = (uint8_t)i; }
+            if (ti > maxT) { maxT = ti; id_max = (uint8_t)i; }
+        }
+        int8_t avgT = (int8_t)(soma / NUM_SENSORS);
+
+#ifdef CAN_LOOPBACK_TEST
+        if (send_address_claim()    != HAL_OK) can_tx_errors++;
+        HAL_Delay(10);
+        if (send_thermistor_summary(minT, maxT, avgT, NUM_SENSORS, id_max, id_min) != HAL_OK) can_tx_errors++;
+        if (send_all_temps_to_esp(temps_i8) != HAL_OK) can_tx_errors++;
+        HAL_Delay(5);   // garante que os 3 frames (~390 µs) já chegaram ao FIFO0
+
+        // Snapshot dos registradores para diagnóstico via Live Expressions
+        can_error_code = hfdcan1.ErrorCode;
+        can_rxf0s      = FDCAN1->RXF0S;
+        can_txfqs      = FDCAN1->TXFQS;
+
+        {
+            FDCAN_RxHeaderTypeDef rxh;
+            uint8_t rxbuf[8];
+            while (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) > 0)
+            {
+                HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &rxh, rxbuf);
+                can_rx_count++;
+                can_loopback_ok = 1;
+            }
+        }
+#else
+        send_address_claim();
+        HAL_Delay(10);
+        send_thermistor_summary(minT, maxT, avgT, NUM_SENSORS, id_max, id_min);
+        send_all_temps_to_esp(temps_i8);
+#endif
+    }
 
   }
   /* USER CODE END 3 */
