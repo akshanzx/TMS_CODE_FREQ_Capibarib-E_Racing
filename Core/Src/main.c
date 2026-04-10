@@ -32,6 +32,12 @@
 #define TIMER_OVERFLOW  65536U      // Contador de 16 bits
 #define SAMPLE_DELAY_MS 250         // Janela de amostragem em ms
 
+// ---- Modo de teste: gera PWM interno para validar o pipeline ----
+// Descomente TEST_MODE para habilitar o gerador de frequência via TIM4 CH1 (PB6).
+// Conecte PB6 com um jumper ao pino de entrada do segmento que quer testar.
+#define TEST_MODE
+#define TEST_FREQ_HZ_DEFAULT    3500U   // Frequência de teste inicial em Hz (1800–5450)
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -50,6 +56,13 @@ DMA_HandleTypeDef hdma_tim2_ch4;
 DMA_HandleTypeDef hdma_tim3_ch4;
 
 /* USER CODE BEGIN PV */
+
+#ifdef TEST_MODE
+TIM_HandleTypeDef htim4_test;       // Handle do timer gerador de teste
+// Volátil para permitir alteração via Live Expressions no debug.
+// Não é 'static' nem 'const' para que o linker mantenha o símbolo visível.
+volatile uint32_t test_freq_hz = TEST_FREQ_HZ_DEFAULT;
+#endif
 
 // Buffers DMA: dois timestamps de borda de subida por canal
 volatile uint32_t in_capture_1[2];
@@ -92,6 +105,10 @@ static float map_float(float x, float in_min, float in_max, float out_min, float
 static float freq_para_tensao(float freq);
 static float tensao_para_temp(float v);
 static void processar_canal(int idx, volatile uint32_t *capture);
+#ifdef TEST_MODE
+static void test_pwm_start(uint32_t freq_hz);
+static void test_pwm_update(uint32_t freq_hz);
+#endif
 
 /* USER CODE END PFP */
 
@@ -144,6 +161,62 @@ static void processar_canal(int idx, volatile uint32_t *capture)
     Temperaturas[idx]  = tensao_para_temp(Tensoes[idx]);
 }
 
+#ifdef TEST_MODE
+// Gera um sinal PWM 50% duty em TIM4 CH1 (PB6) para testar o pipeline V→F→T.
+// Jumper PB6 → pino de entrada do segmento que quer validar.
+static void test_pwm_start(uint32_t freq_hz)
+{
+    __HAL_RCC_TIM4_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    // PB6 como AF2 (TIM4_CH1)
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin       = GPIO_PIN_6;
+    gpio.Mode      = GPIO_MODE_AF_PP;
+    gpio.Pull      = GPIO_NOPULL;
+    gpio.Speed     = GPIO_SPEED_FREQ_LOW;
+    gpio.Alternate = GPIO_AF2_TIM4;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    // ARR para atingir a frequência desejada com timer a 1 MHz
+    uint32_t arr = (TIMER_CLOCK_HZ / freq_hz) - 1U;
+
+    htim4_test.Instance               = TIM4;
+    htim4_test.Init.Prescaler         = 64 - 1;      // 64 MHz / 64 = 1 MHz
+    htim4_test.Init.CounterMode       = TIM_COUNTERMODE_UP;
+    htim4_test.Init.Period            = arr;
+    htim4_test.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
+    htim4_test.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_PWM_Init(&htim4_test) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    // Canal 1: PWM1, 50% duty
+    TIM_OC_InitTypeDef oc = {0};
+    oc.OCMode     = TIM_OCMODE_PWM1;
+    oc.Pulse      = (arr + 1U) / 2U;
+    oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+    oc.OCFastMode = TIM_OCFAST_DISABLE;
+    if (HAL_TIM_PWM_ConfigChannel(&htim4_test, &oc, TIM_CHANNEL_1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    HAL_TIM_PWM_Start(&htim4_test, TIM_CHANNEL_1);
+}
+
+// Atualiza em tempo real a frequência gerada por TIM4 CH1, sem reiniciar o timer.
+// Permite alterar test_freq_hz via Live Expressions no STM32CubeIDE.
+static void test_pwm_update(uint32_t freq_hz)
+{
+    if (freq_hz == 0U) return;
+    uint32_t arr = (TIMER_CLOCK_HZ / freq_hz) - 1U;
+    __HAL_TIM_SET_AUTORELOAD(&htim4_test, arr);
+    __HAL_TIM_SET_COMPARE(&htim4_test, TIM_CHANNEL_1, (arr + 1U) / 2U);
+}
+#endif
+
 // Redireciona printf para SWO/ITM (Serial Wire Viewer)
 int _write(int file, char *ptr, int len)
 {
@@ -191,15 +264,31 @@ int main(void)
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
 
+#ifdef TEST_MODE
+  test_pwm_start(test_freq_hz);
+#endif
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+#ifdef TEST_MODE
+  uint32_t last_test_freq_hz = test_freq_hz;
+#endif
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+#ifdef TEST_MODE
+    // Aplica qualquer alteração feita em test_freq_hz via Live Expressions
+    if (test_freq_hz != last_test_freq_hz)
+    {
+        test_pwm_update(test_freq_hz);
+        last_test_freq_hz = test_freq_hz;
+    }
+#endif
 
     // Reinicia contadores e recomeça captura DMA em todos os canais
     __HAL_TIM_SET_COUNTER(&htim1, 0);
