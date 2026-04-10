@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:www.formulastudent.de)",
+      "WebFetch(domain:sites.usnh.edu)",
+      "WebFetch(domain:arquivos.saebrasil.org.br)",
+      "WebFetch(domain:saebrasil.org.br)",
+      "WebFetch(domain:www.scribd.com)",
+      "WebFetch(domain:www.wisconsinracing.org)"
+    ]
+  }
+}
