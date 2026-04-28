@@ -345,4 +345,48 @@ void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef* htim_base)
 
 /* USER CODE BEGIN 1 */
 
+/**
+ * @brief  FDCAN MSP Initialization — called by HAL_FDCAN_Init().
+ *         Configures PB8 (FDCAN1_RX, AF9) and PB9 (FDCAN1_TX, AF9),
+ *         enables the FDCAN peripheral clock, and enables the NVIC lines
+ *         needed for the TX FIFO (not strictly required if we never use
+ *         TX interrupts, but good practice to have them available).
+ */
+void HAL_FDCAN_MspInit(FDCAN_HandleTypeDef *hfdcan)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    if (hfdcan->Instance == FDCAN1)
+    {
+        /* FDCAN1 peripheral clock */
+        __HAL_RCC_FDCAN_CLK_ENABLE();
+
+        /* GPIO clocks (GPIOB already enabled by TIM3 init, but safe to repeat) */
+        __HAL_RCC_GPIOB_CLK_ENABLE();
+
+        /*
+         * PB8 = FDCAN1_RX (AF9)
+         * PB9 = FDCAN1_TX (AF9)
+         */
+        GPIO_InitStruct.Pin       = CAN_RX_Pin | CAN_TX_Pin;
+        GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
+        GPIO_InitStruct.Pull      = GPIO_NOPULL;
+        GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_HIGH;
+        GPIO_InitStruct.Alternate = GPIO_AF9_FDCAN1;
+        HAL_GPIO_Init(CAN_RX_GPIO_Port, &GPIO_InitStruct);
+    }
+}
+
+/**
+ * @brief  FDCAN MSP De-Initialization.
+ */
+void HAL_FDCAN_MspDeInit(FDCAN_HandleTypeDef *hfdcan)
+{
+    if (hfdcan->Instance == FDCAN1)
+    {
+        __HAL_RCC_FDCAN_CLK_DISABLE();
+        HAL_GPIO_DeInit(CAN_RX_GPIO_Port, CAN_RX_Pin | CAN_TX_Pin);
+    }
+}
+
 /* USER CODE END 1 */

@@ -7,7 +7,11 @@
       "WebFetch(domain:arquivos.saebrasil.org.br)",
       "WebFetch(domain:saebrasil.org.br)",
       "WebFetch(domain:www.scribd.com)",
-      "WebFetch(domain:www.wisconsinracing.org)"
+      "WebFetch(domain:www.wisconsinracing.org)",
+      "Bash(cp \"/c/Users/arthu/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.2/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_fdcan.c\" \"/c/Users/arthu/Documents/GitHub/TMS_V1/Drivers/STM32G4xx_HAL_Driver/Src/\")",
+      "Bash(cp \"/c/Users/arthu/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.2/Drivers/STM32G4xx_HAL_Driver/Inc/stm32g4xx_hal_fdcan.h\" \"/c/Users/arthu/Documents/GitHub/TMS_V1/Drivers/STM32G4xx_HAL_Driver/Inc/\")",
+      "Bash(make -j8 all)",
+      "Bash(where make:*)"
     ]
   }
 }
