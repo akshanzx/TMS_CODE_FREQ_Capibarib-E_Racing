@@ -95,6 +95,8 @@
 #define V_MIN                1.30f  /* V */
 #define V_MAX                2.44f  /* V */
 #define TIMER_OVERFLOW     65536u   /* 16-bit timer ARR = 65535, wraps at 65536 */
+#define FREQ_OPEN_WIRE_HZ  7000.0f  /* Hz — above FREQ_MAX; indicates disconnected cell (open wire → ~11 kHz) */
+#define OPEN_WIRE_MISS_MAX    3u    /* consecutive zero-freq scans before declaring open wire */
 
 /* ---------- Orion 2 BMS CAN protocol ----------
  *
@@ -163,7 +165,7 @@ FDCAN_HandleTypeDef hfdcan1;
  * mostra o valor atual, nunca uma cópia obsoleta de registrador.     */
 volatile float     freq_filtrada[NUM_SEGMENTS][NUM_CHANNELS] __attribute__((used));
 volatile float     temperatures[NUM_SEGMENTS][NUM_CHANNELS]  __attribute__((used));
-volatile float     tensão[NUM_SEGMENTS][NUM_CHANNELS]  __attribute__((used));
+volatile float     tensao[NUM_SEGMENTS][NUM_CHANNELS]  __attribute__((used));
 
 #ifdef TEST_MODE
 static TIM_HandleTypeDef htim16_test;
@@ -188,6 +190,9 @@ static const float voltage_table[] = {
 /* Scan statistics — updated each full cycle */
 static float t_min, t_avg, t_max;
 static uint8_t min_cell, min_seg, max_cell, max_seg;
+
+/* Open-wire detection: counts consecutive zero-freq readings per cell */
+static uint8_t open_wire_count[NUM_SEGMENTS][NUM_CHANNELS];
 
 /* USER CODE END PV */
 
@@ -277,12 +282,14 @@ static float compute_frequency(volatile uint32_t *cap)
     return 1000000.0f / (float)delta;               /* timer @ 1 MHz → µs */
 }
 
-/* ---- Compute min / avg / max across all 80 cells ---- */
+/* ---- Compute min / avg / max across all cells, skipping open-wire (-999) ---- */
 static void ComputeStats(void)
 {
-    float sum = 0.0f;
-    t_min = temperatures[0][0];
-    t_max = temperatures[0][0];
+    float   sum        = 0.0f;
+    uint8_t valid_cnt  = 0u;
+
+    t_min    = 200.0f;   /* sentinel: higher than any real temperature */
+    t_max    = -200.0f;  /* sentinel: lower  than any real temperature */
     min_seg  = 0u; min_cell = 0u;
     max_seg  = 0u; max_cell = 0u;
 
@@ -291,12 +298,18 @@ static void ComputeStats(void)
         for (uint8_t ch = 0u; ch < NUM_CHANNELS; ch++)
         {
             float t = temperatures[seg][ch];
+            if (t <= -998.0f) continue;   /* skip open-wire sentinel */
             sum += t;
+            valid_cnt++;
             if (t < t_min) { t_min = t; min_seg = seg; min_cell = ch; }
             if (t > t_max) { t_max = t; max_seg = seg; max_cell = ch; }
         }
     }
-    t_avg = sum / (float)NUM_CELLS;
+
+    t_avg = (valid_cnt > 0u) ? (sum / (float)valid_cnt) : -999.0f;
+
+    /* If no valid cell found, reset sentinels to avoid sending garbage on CAN */
+    if (valid_cnt == 0u) { t_min = -999.0f; t_max = -999.0f; }
 }
 
 /* ---- Encode temperature to Orion 2 byte format ---- */
@@ -395,6 +408,47 @@ static void CAN_SendSummaryPacket(void)
     HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &hdr, data);
 }
 
+/* ---- Per-segment open-wire-aware processing --------------------------------
+ *
+ * Three cases:
+ *   freq_raw > FREQ_OPEN_WIRE_HZ  → V-to-F output above valid range (open wire
+ *                                    detected directly): mark -999, reset counter.
+ *   freq_raw > 0                  → valid measurement: update EMA and compute temp.
+ *   freq_raw == 0                 → no edges captured (opto bandwidth limit at high
+ *                                    freq, or no signal): increment miss counter;
+ *                                    after OPEN_WIRE_MISS_MAX consecutive misses
+ *                                    mark -999.  EMA and tensao are not updated in
+ *                                    either fault case so the last valid reading is
+ *                                    preserved for quick recovery on reconnection.
+ */
+static void process_segment(uint8_t seg, uint8_t ch, volatile uint32_t *cap)
+{
+    float freq_raw = compute_frequency(cap);
+
+    if (freq_raw > FREQ_OPEN_WIRE_HZ)
+    {
+        open_wire_count[seg][ch]  = 0u;
+        temperatures[seg][ch]     = -999.0f;
+        tensao[seg][ch]           = 0.0f;
+    }
+    else if (freq_raw > 0.0f)
+    {
+        open_wire_count[seg][ch]  = 0u;
+        freq_filtrada[seg][ch]    = EMA_ALPHA * freq_raw
+                                  + (1.0f - EMA_ALPHA) * freq_filtrada[seg][ch];
+        temperatures[seg][ch]     = voltage_to_temp(
+                                        freq_to_voltage(freq_filtrada[seg][ch]));
+        tensao[seg][ch]           = freq_to_voltage(freq_filtrada[seg][ch]);
+    }
+    else
+    {
+        if (open_wire_count[seg][ch] < OPEN_WIRE_MISS_MAX)
+            open_wire_count[seg][ch]++;
+        if (open_wire_count[seg][ch] >= OPEN_WIRE_MISS_MAX)
+            temperatures[seg][ch] = -999.0f;
+    }
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -437,6 +491,12 @@ int main(void)
 
   /* USART2 via ST-Link VCP — PA2=TX, PA3=RX, 115200 baud */
   USART2_Init();
+
+  /* Pre-seed EMA with midpoint frequency so the first scan gives a sensible
+     reading instead of converging from 0 Hz (which produces 120 °C initially). */
+  for (uint8_t s = 0u; s < NUM_SEGMENTS; s++)
+      for (uint8_t c = 0u; c < NUM_CHANNELS; c++)
+          freq_filtrada[s][c] = (FREQ_MIN + FREQ_MAX) * 0.5f;  /* ~3625 Hz */
 
 #ifdef TEST_MODE
   test_pwm_start(test_freq_hz);
@@ -518,59 +578,13 @@ int main(void)
            MUX_MEASURE_MS = 10 ms → very safe margin. */
         HAL_Delay(MUX_MEASURE_MS);
 
-        /* 6. Compute frequency → voltage → temperature for all 5 segments */
-        float freq_raw;
-
-        /* Segment 0  (TIM2 CH1, PA0) */
-        freq_raw = compute_frequency(in_capture_1);
-        if (freq_raw > 0.0f)
-        {
-            freq_filtrada[0][ch] = EMA_ALPHA * freq_raw
-                                 + (1.0f - EMA_ALPHA) * freq_filtrada[0][ch];
-            temperatures[0][ch] = voltage_to_temp(
-                                      freq_to_voltage(freq_filtrada[0][ch]));
-            tensão[0][ch] = freq_to_voltage(freq_filtrada[0][ch]);
-        }
-
-        /* Segment 1  (TIM2 CH2, PA1) */
-        freq_raw = compute_frequency(in_capture_2);
-        if (freq_raw > 0.0f)
-        {
-            freq_filtrada[1][ch] = EMA_ALPHA * freq_raw
-                                 + (1.0f - EMA_ALPHA) * freq_filtrada[1][ch];
-            temperatures[1][ch] = voltage_to_temp(
-                                      freq_to_voltage(freq_filtrada[1][ch]));
-        }
-
-        /* Segment 2  (TIM3 CH4, PB1) */
-        freq_raw = compute_frequency(in_capture_3);
-        if (freq_raw > 0.0f)
-        {
-            freq_filtrada[2][ch] = EMA_ALPHA * freq_raw
-                                 + (1.0f - EMA_ALPHA) * freq_filtrada[2][ch];
-            temperatures[2][ch] = voltage_to_temp(
-                                      freq_to_voltage(freq_filtrada[2][ch]));
-        }
-
-        /* Segment 3  (TIM2 CH4, PB11) */
-        freq_raw = compute_frequency(in_capture_4);
-        if (freq_raw > 0.0f)
-        {
-            freq_filtrada[3][ch] = EMA_ALPHA * freq_raw
-                                 + (1.0f - EMA_ALPHA) * freq_filtrada[3][ch];
-            temperatures[3][ch] = voltage_to_temp(
-                                      freq_to_voltage(freq_filtrada[3][ch]));
-        }
-
-        /* Segment 4  (TIM1 CH1, PA8) */
-        freq_raw = compute_frequency(in_capture_5);
-        if (freq_raw > 0.0f)
-        {
-            freq_filtrada[4][ch] = EMA_ALPHA * freq_raw
-                                 + (1.0f - EMA_ALPHA) * freq_filtrada[4][ch];
-            temperatures[4][ch] = voltage_to_temp(
-                                      freq_to_voltage(freq_filtrada[4][ch]));
-        }
+        /* 6. Compute frequency → voltage → temperature for all 5 segments.
+              process_segment() handles open-wire detection (see definition above). */
+        process_segment(0u, ch, in_capture_1);  /* TIM2 CH1, PA0  */
+        process_segment(1u, ch, in_capture_2);  /* TIM2 CH2, PA1  */
+        process_segment(2u, ch, in_capture_3);  /* TIM3 CH4, PB1  */
+        process_segment(3u, ch, in_capture_4);  /* TIM2 CH4, PB11 */
+        process_segment(4u, ch, in_capture_5);  /* TIM1 CH1, PA8  */
     }
 
     /* ================================================================
