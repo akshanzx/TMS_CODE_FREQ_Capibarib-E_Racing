@@ -53,7 +53,6 @@
   ******************************************************************************
   */
 /* USER CODE END Header */
-
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 
@@ -72,7 +71,8 @@
 /* USER CODE BEGIN PD */
 
 /* ---------- System dimensions ---------- */
-#define NUM_SEGMENTS         1u    /* one V-to-F + isolator chain per segment */
+#define MAX_SEGMENTS         5u    /* physical timer channels — fixed array dimension, never change */
+#define NUM_SEGMENTS         1u    /* active segments for bring-up; change to 5 for full-pack */
 #define NUM_CHANNELS        16u    /* 16-channel MUX per segment               */
 #define NUM_CELLS           (NUM_SEGMENTS * NUM_CHANNELS)   /* 80 total        */
 
@@ -90,38 +90,26 @@
 
 /* ---------- V-to-F / temperature conversion ---------- */
 #define EMA_ALPHA            0.3f   /* EMA smoothing: lower = smoother, slower */
-#define FREQ_MIN          1800.0f   /* Hz  @ V_MIN (hottest cell) */
-#define FREQ_MAX          5450.0f   /* Hz  @ V_MAX (coldest cell) */
+#define FREQ_MIN          1829.0f   /* Hz  @ V_MIN (hottest cell) */
+#define FREQ_MAX          5515.0f   /* Hz  @ V_MAX (coldest cell) */
 #define V_MIN                1.30f  /* V */
 #define V_MAX                2.44f  /* V */
 #define TIMER_OVERFLOW     65536u   /* 16-bit timer ARR = 65535, wraps at 65536 */
+#define FREQ_OPEN_WIRE_HZ  7000.0f  /* Hz — above FREQ_MAX; indicates disconnected cell (open wire → ~11 kHz) */
+#define OPEN_WIRE_MISS_MAX    3u    /* consecutive zero-freq scans before declaring open wire */
 
-/* ---------- Orion 2 BMS CAN protocol ----------
+/* ---------- Orion 2 BMS — Thermistor Expansion Module protocol ----------
  *
- * The Orion 2 BMS receives cell temperatures from an external thermistor
- * module via CAN.  Ten 8-byte classic CAN frames carry all 80 readings:
+ * Two frame types must be sent to simulate a thermistor expansion module
+ * (Note #8 of the official protocol document):
  *
- *   Msg index  CAN ID           Cells
- *   ---------  ---------------  ----------------------
- *       0      ORION2_BASE+0    Seg 0, cells  0– 7
- *       1      ORION2_BASE+1    Seg 0, cells  8–15
- *       2      ORION2_BASE+2    Seg 1, cells  0– 7
- *       ...
- *       9      ORION2_BASE+9    Seg 4, cells  8–15
+ *   0x18EEFF80+seg  J1939 Address Claim   — every scan (~200 ms target)
+ *   0x1839F380+seg  Thermistor Broadcast  — every scan (~100 ms target)
  *
- * Temperature encoding: data_byte = (uint8_t)(temp_°C + 40)
- *   Value 0  → −40 °C
- *   Value 40 →   0 °C
- *   Value 80 →  +40 °C
- *   Value 160→ +120 °C  (maximum in-range cell temperature)
- *
- * VERIFY ORION2_BASE_ID against the protocol table shown in your BMS
- * programming software — change the define below if your Orion 2 is
- * configured to listen on a different base address.
+ * Each segment is treated as an independent thermistor module (seg 0–4).
+ * Temperature encoding: signed 8-bit, direct °C (no offset).
+ * Checksum (byte 8): sum(bytes 1–7) + 0x39 + 8 (frame length).
  */
-#define ORION2_BASE_ID       0x1839F380u   /* 29-bit extended CAN ID */
-#define ORION2_TEMP_OFFSET   40            /* encoding offset in °C  */
-#define ORION2_NUM_MSGS      10u           /* 80 cells / 8 per frame */
 
 /* ---------- Summary packet to secondary MCU ---------- */
 #define SUMMARY_CAN_ID       0x100u        /* 11-bit standard CAN ID */
@@ -135,7 +123,7 @@
  * Faixa válida: 1800–5450 Hz.
  * -------------------------------------------------------------------------*/
 #define TEST_MODE
-#define TEST_FREQ_HZ_DEFAULT  4000U     /* frequência inicial em Hz */
+#define TEST_FREQ_HZ_DEFAULT  3600U     /* frequência inicial em Hz */
 
 /* USER CODE END PD */
 
@@ -145,6 +133,8 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+FDCAN_HandleTypeDef hfdcan2;
+
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
@@ -156,14 +146,19 @@ DMA_HandleTypeDef hdma_tim3_ch4;
 
 /* USER CODE BEGIN PV */
 
-FDCAN_HandleTypeDef hfdcan1;
-
 /* ---- Live-expression variables (sempre presentes na RAM) ----
  * volatile: toda escrita vai direto para memória → Live Expressions sempre
  * mostra o valor atual, nunca uma cópia obsoleta de registrador.     */
-volatile float     freq_filtrada[NUM_SEGMENTS][NUM_CHANNELS] __attribute__((used));
-volatile float     temperatures[NUM_SEGMENTS][NUM_CHANNELS]  __attribute__((used));
-volatile float     tensão[NUM_SEGMENTS][NUM_CHANNELS]  __attribute__((used));
+/* Arrays sized to MAX_SEGMENTS (5) regardless of NUM_SEGMENTS.
+ * process_segment() is called for all 5 hardware channels unconditionally;
+ * using [NUM_SEGMENTS] here caused a buffer overflow that aliased
+ * freq_filtrada[1][ch] onto temperatures[0][ch], corrupting t_min. */
+volatile float     freq_filtrada[MAX_SEGMENTS][NUM_CHANNELS] __attribute__((used));
+volatile float     temperatures[MAX_SEGMENTS][NUM_CHANNELS]  __attribute__((used));
+volatile float     tensao[MAX_SEGMENTS][NUM_CHANNELS]        __attribute__((used));
+
+/* 1 = all active-segment cells have valid readings; 0 = at least one open wire */
+volatile uint8_t   connection_ok                             __attribute__((used));
 
 #ifdef TEST_MODE
 static TIM_HandleTypeDef htim16_test;
@@ -189,6 +184,9 @@ static const float voltage_table[] = {
 static float t_min, t_avg, t_max;
 static uint8_t min_cell, min_seg, max_cell, max_seg;
 
+/* Open-wire detection: counts consecutive zero-freq readings per cell */
+static uint8_t open_wire_count[MAX_SEGMENTS][NUM_CHANNELS];
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -198,6 +196,7 @@ static void MX_DMA_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
+static void MX_FDCAN2_Init(void);
 /* USER CODE BEGIN PFP */
 static void FDCAN_Config(void);
 static void USART2_Init(void);
@@ -277,56 +276,59 @@ static float compute_frequency(volatile uint32_t *cap)
     return 1000000.0f / (float)delta;               /* timer @ 1 MHz → µs */
 }
 
-/* ---- Compute min / avg / max across all 80 cells ---- */
+/* ---- Compute min / avg / max across all cells, skipping open-wire (-999) ---- */
 static void ComputeStats(void)
 {
-    float sum = 0.0f;
-    t_min = temperatures[0][0];
-    t_max = temperatures[0][0];
+    float   sum        = 0.0f;
+    uint8_t valid_cnt  = 0u;
+
+    t_min    = 200.0f;   /* sentinel: higher than any real temperature */
+    t_max    = -200.0f;  /* sentinel: lower  than any real temperature */
     min_seg  = 0u; min_cell = 0u;
     max_seg  = 0u; max_cell = 0u;
+    connection_ok = 1u;  /* assume healthy; cleared on first open-wire cell found */
 
     for (uint8_t seg = 0u; seg < NUM_SEGMENTS; seg++)
     {
         for (uint8_t ch = 0u; ch < NUM_CHANNELS; ch++)
         {
+#ifdef TEST_MODE
+            if (seg == 0u && ch == 14u) continue;  /* canal 14 ignorado em TEST_MODE */
+#endif
             float t = temperatures[seg][ch];
+            if (t <= -998.0f)
+            {
+                connection_ok = 0u;   /* at least one open wire detected */
+                continue;
+            }
             sum += t;
+            valid_cnt++;
             if (t < t_min) { t_min = t; min_seg = seg; min_cell = ch; }
             if (t > t_max) { t_max = t; max_seg = seg; max_cell = ch; }
         }
     }
-    t_avg = sum / (float)NUM_CELLS;
+
+    t_avg = (valid_cnt > 0u) ? (sum / (float)valid_cnt) : -999.0f;
+
+    /* If no valid cell found, reset sentinels to avoid sending garbage on CAN */
+    if (valid_cnt == 0u) { t_min = -999.0f; t_max = -999.0f; }
 }
 
-/* ---- Encode temperature to Orion 2 byte format ---- */
-static uint8_t encode_temp(float temp_c)
-{
-    int16_t raw = (int16_t)temp_c + ORION2_TEMP_OFFSET;
-    if (raw < 0)   raw = 0;
-    if (raw > 255) raw = 255;
-    return (uint8_t)raw;
-}
-
-/* ---- Send 10 CAN frames to Orion 2 BMS ---- *
+/* ---- J1939 Address Claim (0x18EEFF80 + seg) — one frame per module ----
  *
- * Frame layout (10 messages × 8 bytes = 80 thermistor readings):
+ * Required for the Orion 2 BMS to recognise each simulated thermistor module.
+ * CAN ID last byte = source address (0x80 + seg).
  *
- *   Msg  CAN ID           Seg  Cells
- *    0   ORION2_BASE+0     0   0– 7
- *    1   ORION2_BASE+1     0   8–15
- *    2   ORION2_BASE+2     1   0– 7
- *    3   ORION2_BASE+3     1   8–15
- *    4   ORION2_BASE+4     2   0– 7
- *    5   ORION2_BASE+5     2   8–15
- *    6   ORION2_BASE+6     3   0– 7
- *    7   ORION2_BASE+7     3   8–15
- *    8   ORION2_BASE+8     4   0– 7
- *    9   ORION2_BASE+9     4   8–15
+ *   Byte 1–3  J1939 unique identifier (default 0xF3 0x00 0x80)
+ *   Byte 4    BMS target address (0xF3)
+ *   Byte 5    Module number << 3
+ *   Byte 6    0x40  (constant)
+ *   Byte 7    0x1E  (constant)
+ *   Byte 8    0x90  (constant)
  */
-static void CAN_SendOrion2Data(void)
+static void CAN_SendAddressClaim(void)
 {
-    FDCAN_TxHeaderTypeDef hdr;
+    FDCAN_TxHeaderTypeDef hdr = {0};
     uint8_t data[8];
 
     hdr.IdType              = FDCAN_EXTENDED_ID;
@@ -338,22 +340,79 @@ static void CAN_SendOrion2Data(void)
     hdr.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
     hdr.MessageMarker       = 0u;
 
-    uint8_t msg = 0u;
+    data[3] = 0xF3u;
+    data[5] = 0x40u;
+    data[6] = 0x1Eu;
+    data[7] = 0x90u;
+
     for (uint8_t seg = 0u; seg < NUM_SEGMENTS; seg++)
     {
-        /* Lower half: cells 0–7 */
-        hdr.Identifier = ORION2_BASE_ID + msg;
-        for (uint8_t b = 0u; b < 8u; b++)
-            data[b] = encode_temp(temperatures[seg][b]);
-        HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &hdr, data);
-        msg++;
+        data[0] = 0xF3u;
+        data[1] = 0x00u;
+        data[2] = 0x80u;
+        data[4] = (uint8_t)(seg << 3u);   /* module number << 3 */
 
-        /* Upper half: cells 8–15 */
-        hdr.Identifier = ORION2_BASE_ID + msg;
-        for (uint8_t b = 0u; b < 8u; b++)
-            data[b] = encode_temp(temperatures[seg][8u + b]);
-        HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &hdr, data);
-        msg++;
+        hdr.Identifier = 0x18EEFF80u + seg;
+        HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &hdr, data);
+    }
+}
+
+/* ---- Thermistor Module Broadcast (0x1839F380 + seg) — one frame per module ----
+ *
+ *   Byte 1  Module number (= seg, 0–4)
+ *   Byte 2  Lowest  thermistor value (int8_t, °C)
+ *   Byte 3  Highest thermistor value (int8_t, °C)
+ *   Byte 4  Average thermistor value (int8_t, °C)
+ *   Byte 5  Number of thermistors enabled; bit 7 set if any fault on this module
+ *   Byte 6  Highest thermistor ID on the module (zero-based MUX channel)
+ *   Byte 7  Lowest  thermistor ID on the module (zero-based MUX channel)
+ *   Byte 8  Checksum: sum(bytes 1–7) + 0x39 + 8
+ */
+static void CAN_SendThermistorData(void)
+{
+    FDCAN_TxHeaderTypeDef hdr = {0};
+    uint8_t data[8];
+
+    hdr.IdType              = FDCAN_EXTENDED_ID;
+    hdr.TxFrameType         = FDCAN_DATA_FRAME;
+    hdr.DataLength          = FDCAN_DLC_BYTES_8;
+    hdr.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+    hdr.BitRateSwitch       = FDCAN_BRS_OFF;
+    hdr.FDFormat            = FDCAN_CLASSIC_CAN;
+    hdr.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
+    hdr.MessageMarker       = 0u;
+
+    for (uint8_t seg = 0u; seg < NUM_SEGMENTS; seg++)
+    {
+        float   seg_min = 200.0f, seg_max = -200.0f, seg_sum = 0.0f;
+        uint8_t valid = 0u, fault = 0u;
+        uint8_t highest_id = 0u, lowest_id = 0u;
+
+        for (uint8_t ch = 0u; ch < NUM_CHANNELS; ch++)
+        {
+            float t = temperatures[seg][ch];
+            if (t <= -998.0f) { fault = 1u; continue; }
+            seg_sum += t;
+            valid++;
+            if (t < seg_min) { seg_min = t; lowest_id  = ch; }
+            if (t > seg_max) { seg_max = t; highest_id = ch; }
+        }
+
+        data[0] = seg;
+        data[1] = (uint8_t)(int8_t)(valid > 0u ? seg_min : -40.0f);
+        data[2] = (uint8_t)(int8_t)(valid > 0u ? seg_max : -40.0f);
+        data[3] = (uint8_t)(int8_t)(valid > 0u ? seg_sum / (float)valid : -40.0f);
+        data[4] = (valid & 0x7Fu) | (fault ? 0x80u : 0x00u);
+        data[5] = highest_id;
+        data[6] = lowest_id;
+
+        /* Checksum: sum of bytes 0–6 + 0x39 + frame length (8) */
+        uint8_t cksum = 0x39u + 8u;
+        for (uint8_t i = 0u; i < 7u; i++) cksum += data[i];
+        data[7] = cksum;
+
+        hdr.Identifier = 0x1839F380u + seg;
+        HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &hdr, data);
     }
 }
 
@@ -383,16 +442,57 @@ static void CAN_SendSummaryPacket(void)
     hdr.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
     hdr.MessageMarker       = 0u;
 
-    data[0] = encode_temp(t_min);
+    data[0] = (uint8_t)(int8_t)t_min;
     data[1] = min_cell;
     data[2] = min_seg;
-    data[3] = encode_temp(t_avg);
-    data[4] = encode_temp(t_max);
+    data[3] = (uint8_t)(int8_t)t_avg;
+    data[4] = (uint8_t)(int8_t)t_max;
     data[5] = max_cell;
     data[6] = max_seg;
     data[7] = 0x00u;
 
-    HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &hdr, data);
+    HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan2, &hdr, data);
+}
+
+/* ---- Per-segment open-wire-aware processing --------------------------------
+ *
+ * Three cases:
+ *   freq_raw > FREQ_OPEN_WIRE_HZ  → V-to-F output above valid range (open wire
+ *                                    detected directly): mark -999, reset counter.
+ *   freq_raw > 0                  → valid measurement: update EMA and compute temp.
+ *   freq_raw == 0                 → no edges captured (opto bandwidth limit at high
+ *                                    freq, or no signal): increment miss counter;
+ *                                    after OPEN_WIRE_MISS_MAX consecutive misses
+ *                                    mark -999.  EMA and tensao are not updated in
+ *                                    either fault case so the last valid reading is
+ *                                    preserved for quick recovery on reconnection.
+ */
+static void process_segment(uint8_t seg, uint8_t ch, volatile uint32_t *cap)
+{
+    float freq_raw = compute_frequency(cap);
+
+    if (freq_raw > FREQ_OPEN_WIRE_HZ)
+    {
+        open_wire_count[seg][ch]  = 0u;
+        temperatures[seg][ch]     = -999.0f;
+        tensao[seg][ch]           = 0.0f;
+    }
+    else if (freq_raw > 0.0f)
+    {
+        open_wire_count[seg][ch]  = 0u;
+        freq_filtrada[seg][ch]    = EMA_ALPHA * freq_raw
+                                  + (1.0f - EMA_ALPHA) * freq_filtrada[seg][ch];
+        temperatures[seg][ch]     = voltage_to_temp(
+                                        freq_to_voltage(freq_filtrada[seg][ch]));
+        tensao[seg][ch]           = freq_to_voltage(freq_filtrada[seg][ch]);
+    }
+    else
+    {
+        if (open_wire_count[seg][ch] < OPEN_WIRE_MISS_MAX)
+            open_wire_count[seg][ch]++;
+        if (open_wire_count[seg][ch] >= OPEN_WIRE_MISS_MAX)
+            temperatures[seg][ch] = -999.0f;
+    }
 }
 
 /* USER CODE END 0 */
@@ -430,6 +530,7 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM2_Init();
   MX_TIM3_Init();
+  MX_FDCAN2_Init();
   /* USER CODE BEGIN 2 */
 
   /* Configure FDCAN1 for 500 kbps (calls HAL_FDCAN_MspInit → GPIO + clock) */
@@ -437,6 +538,14 @@ int main(void)
 
   /* USART2 via ST-Link VCP — PA2=TX, PA3=RX, 115200 baud */
   USART2_Init();
+
+  /* Pre-seed EMA with midpoint frequency so the first scan gives a sensible
+     reading instead of converging from 0 Hz (which produces 120 °C initially).
+     All MAX_SEGMENTS rows are seeded so process_segment(1..4,...) never reads
+     uninitialized EMA state. */
+  for (uint8_t s = 0u; s < MAX_SEGMENTS; s++)
+      for (uint8_t c = 0u; c < NUM_CHANNELS; c++)
+          freq_filtrada[s][c] = (FREQ_MIN + FREQ_MAX) * 0.5f;  /* ~3672 Hz */
 
 #ifdef TEST_MODE
   test_pwm_start(test_freq_hz);
@@ -518,66 +627,21 @@ int main(void)
            MUX_MEASURE_MS = 10 ms → very safe margin. */
         HAL_Delay(MUX_MEASURE_MS);
 
-        /* 6. Compute frequency → voltage → temperature for all 5 segments */
-        float freq_raw;
-
-        /* Segment 0  (TIM2 CH1, PA0) */
-        freq_raw = compute_frequency(in_capture_1);
-        if (freq_raw > 0.0f)
-        {
-            freq_filtrada[0][ch] = EMA_ALPHA * freq_raw
-                                 + (1.0f - EMA_ALPHA) * freq_filtrada[0][ch];
-            temperatures[0][ch] = voltage_to_temp(
-                                      freq_to_voltage(freq_filtrada[0][ch]));
-            tensão[0][ch] = freq_to_voltage(freq_filtrada[0][ch]);
-        }
-
-        /* Segment 1  (TIM2 CH2, PA1) */
-        freq_raw = compute_frequency(in_capture_2);
-        if (freq_raw > 0.0f)
-        {
-            freq_filtrada[1][ch] = EMA_ALPHA * freq_raw
-                                 + (1.0f - EMA_ALPHA) * freq_filtrada[1][ch];
-            temperatures[1][ch] = voltage_to_temp(
-                                      freq_to_voltage(freq_filtrada[1][ch]));
-        }
-
-        /* Segment 2  (TIM3 CH4, PB1) */
-        freq_raw = compute_frequency(in_capture_3);
-        if (freq_raw > 0.0f)
-        {
-            freq_filtrada[2][ch] = EMA_ALPHA * freq_raw
-                                 + (1.0f - EMA_ALPHA) * freq_filtrada[2][ch];
-            temperatures[2][ch] = voltage_to_temp(
-                                      freq_to_voltage(freq_filtrada[2][ch]));
-        }
-
-        /* Segment 3  (TIM2 CH4, PB11) */
-        freq_raw = compute_frequency(in_capture_4);
-        if (freq_raw > 0.0f)
-        {
-            freq_filtrada[3][ch] = EMA_ALPHA * freq_raw
-                                 + (1.0f - EMA_ALPHA) * freq_filtrada[3][ch];
-            temperatures[3][ch] = voltage_to_temp(
-                                      freq_to_voltage(freq_filtrada[3][ch]));
-        }
-
-        /* Segment 4  (TIM1 CH1, PA8) */
-        freq_raw = compute_frequency(in_capture_5);
-        if (freq_raw > 0.0f)
-        {
-            freq_filtrada[4][ch] = EMA_ALPHA * freq_raw
-                                 + (1.0f - EMA_ALPHA) * freq_filtrada[4][ch];
-            temperatures[4][ch] = voltage_to_temp(
-                                      freq_to_voltage(freq_filtrada[4][ch]));
-        }
+        /* 6. Compute frequency → voltage → temperature for all 5 segments.
+              process_segment() handles open-wire detection (see definition above). */
+        process_segment(0u, ch, in_capture_1);  /* TIM2 CH1, PA0  */
+        process_segment(1u, ch, in_capture_2);  /* TIM2 CH2, PA1  */
+        process_segment(2u, ch, in_capture_3);  /* TIM3 CH4, PB1  */
+        process_segment(3u, ch, in_capture_4);  /* TIM2 CH4, PB11 */
+        process_segment(4u, ch, in_capture_5);  /* TIM1 CH1, PA8  */
     }
 
     /* ================================================================
      * AFTER FULL SCAN: compute stats and transmit CAN frames
      * ================================================================ */
     ComputeStats();
-    CAN_SendOrion2Data();
+    CAN_SendAddressClaim();
+    CAN_SendThermistorData();
     CAN_SendSummaryPacket();
 
     /* UART output to PC dashboard — one line per cell of segment 0:
@@ -644,6 +708,49 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief FDCAN2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_FDCAN2_Init(void)
+{
+
+  /* USER CODE BEGIN FDCAN2_Init 0 */
+
+  /* USER CODE END FDCAN2_Init 0 */
+
+  /* USER CODE BEGIN FDCAN2_Init 1 */
+
+  /* USER CODE END FDCAN2_Init 1 */
+  hfdcan2.Instance = FDCAN2;
+  hfdcan2.Init.ClockDivider = FDCAN_CLOCK_DIV1;
+  hfdcan2.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
+  hfdcan2.Init.Mode = FDCAN_MODE_NORMAL;
+  hfdcan2.Init.AutoRetransmission = DISABLE;
+  hfdcan2.Init.TransmitPause = DISABLE;
+  hfdcan2.Init.ProtocolException = DISABLE;
+  hfdcan2.Init.NominalPrescaler = 8;
+  hfdcan2.Init.NominalSyncJumpWidth = 1;
+  hfdcan2.Init.NominalTimeSeg1 = 13;
+  hfdcan2.Init.NominalTimeSeg2 = 2;
+  hfdcan2.Init.DataPrescaler = 1;
+  hfdcan2.Init.DataSyncJumpWidth = 1;
+  hfdcan2.Init.DataTimeSeg1 = 1;
+  hfdcan2.Init.DataTimeSeg2 = 1;
+  hfdcan2.Init.StdFiltersNbr = 0;
+  hfdcan2.Init.ExtFiltersNbr = 0;
+  hfdcan2.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
+  if (HAL_FDCAN_Init(&hfdcan2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN FDCAN2_Init 2 */
+
+  /* USER CODE END FDCAN2_Init 2 */
+
 }
 
 /**
@@ -841,14 +948,19 @@ static void MX_DMA_Init(void)
   __HAL_RCC_DMA1_CLK_ENABLE();
 
   /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+  /* DMA1_Channel2_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
+  /* DMA1_Channel4_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel4_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel4_IRQn);
+  /* DMA1_Channel5_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel5_IRQn);
+  /* DMA1_Channel6_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel6_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel6_IRQn);
 
@@ -895,51 +1007,38 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /**
- * @brief  Configure FDCAN1 for classic CAN at 500 kbps.
+ * @brief  Reconfigure FDCAN2 for classic CAN at 500 kbps and start it.
  *
- * Bit timing (FDCAN clock = 64 MHz, prescaler = 8):
- *   TQ duration = 8 / 64 MHz = 125 ns
- *   Bit time    = (1 + 13 + 2) × 125 ns = 2000 ns = 500 kbps
- *   Sample point = (1 + 13) / 16 = 87.5 %
+ * MX_FDCAN2_Init() (generated by CubeMX) already configured the GPIO and clock
+ * via HAL_FDCAN_MspInit. This function overrides the bit timing with the correct
+ * 500 kbps parameters and configures the global filter before starting.
  *
- * HAL_FDCAN_Init() calls HAL_FDCAN_MspInit() (defined in
- * stm32g4xx_hal_msp.c) which enables the FDCAN peripheral clock and
- * configures PB8/PB9 as FDCAN1_RX/TX with AF9.
+ * Bit timing (FDCAN clock = 64 MHz via PCLK1, prescaler = 8):
+ *   TQ = 8 / 64 MHz = 125 ns
+ *   Bit time = (1 + 13 + 2) × 125 ns = 2000 ns → 500 kbps, sample point 87.5%
  *
- * All incoming frames are rejected (we only transmit).
+ * TODO: set these values in the .ioc (Prescaler=8, TS1=13, TS2=2) so
+ *       MX_FDCAN2_Init() generates the correct timing and this override
+ *       can be removed.
  */
 static void FDCAN_Config(void)
 {
-    hfdcan1.Instance                  = FDCAN1;
-    hfdcan1.Init.ClockDivider         = FDCAN_CLOCK_DIV1;
-    hfdcan1.Init.FrameFormat          = FDCAN_FRAME_CLASSIC;
-    hfdcan1.Init.Mode                 = FDCAN_MODE_NORMAL;
-    hfdcan1.Init.AutoRetransmission   = ENABLE;
-    hfdcan1.Init.TransmitPause        = DISABLE;
-    hfdcan1.Init.ProtocolException    = DISABLE;
-    hfdcan1.Init.NominalPrescaler     = 8u;
-    hfdcan1.Init.NominalSyncJumpWidth = 1u;
-    hfdcan1.Init.NominalTimeSeg1      = 13u;
-    hfdcan1.Init.NominalTimeSeg2      = 2u;
-    /* Data phase fields unused for classic CAN but must be set */
-    hfdcan1.Init.DataPrescaler        = 1u;
-    hfdcan1.Init.DataSyncJumpWidth    = 1u;
-    hfdcan1.Init.DataTimeSeg1         = 1u;
-    hfdcan1.Init.DataTimeSeg2         = 1u;
-    hfdcan1.Init.StdFiltersNbr        = 0u;
-    hfdcan1.Init.ExtFiltersNbr        = 0u;
-    hfdcan1.Init.TxFifoQueueMode      = FDCAN_TX_FIFO_OPERATION;
+    hfdcan2.Init.AutoRetransmission   = ENABLE;
+    hfdcan2.Init.NominalPrescaler     = 8u;
+    hfdcan2.Init.NominalSyncJumpWidth = 1u;
+    hfdcan2.Init.NominalTimeSeg1      = 13u;
+    hfdcan2.Init.NominalTimeSeg2      = 2u;
 
-    if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
+    if (HAL_FDCAN_Init(&hfdcan2) != HAL_OK)
         Error_Handler();
 
-    /* Reject all incoming frames — we only need to transmit */
-    if (HAL_FDCAN_ConfigGlobalFilter(&hfdcan1,
+    /* Reject all incoming frames — we only transmit */
+    if (HAL_FDCAN_ConfigGlobalFilter(&hfdcan2,
             FDCAN_REJECT, FDCAN_REJECT,
             FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE) != HAL_OK)
         Error_Handler();
 
-    if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
+    if (HAL_FDCAN_Start(&hfdcan2) != HAL_OK)
         Error_Handler();
 }
 
@@ -1046,7 +1145,7 @@ void Error_Handler(void)
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
-  * where the assert_param error has occurred.
+  *         where the assert_param error has occurred.
   * @param  file: pointer to the source file name
   * @param  line: assert_param error line source number
   * @retval None

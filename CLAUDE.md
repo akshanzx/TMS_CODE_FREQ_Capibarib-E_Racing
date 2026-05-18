@@ -9,115 +9,113 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Vehicle & Competition Context
 
 - Competition: Formula SAE Brasil 2026 (FSAE-B)
-- Vehicle: Formula SAE Electric
-- Battery cells: ENEPAQ VTC6 cylindrical 18650 Li-ion (1×4 physical holder format)
-- Pack configuration: **80S1P** total — 5 segments of **16S1P** each (16 cells in series per segment, 80 cells total)
-- Segment voltage: ~57.6V nominal / ~67.2V max (well under the 120V FSAE per-segment limit)
+- Battery cells: ENEPAQ VTC6 cylindrical 18650 Li-ion
+- Pack configuration: **80S1P** — 5 segments of **16S1P** each
+- Segment voltage: ~57.6V nominal / ~67.2V max
 - Total pack voltage: ~288V nominal / ~336V max
-- Each segment has its own internal temperature sensor bus (already present on the cell-monitoring network)
 
-### The Problem This Solves
+### The Isolation Problem
 
-FSAE rules require **galvanic isolation** between each high-voltage accumulator segment and the low-voltage (GLV) vehicle systems. Each segment floats at a different potential. Reading temperature sensors directly from a microcontroller would violate isolation.
-
-### The Isolation Strategy
-
-Each segment's temperature bus already averages the temperatures of its cells into a single analog voltage. A custom circuit reads this voltage and converts it to a **frequency signal** (V→F conversion). Frequency (a digital pulse train) can cross an isolation barrier (optocoupler/capacitive isolator) without any DC conductive path — maintaining full galvanic isolation between the HV segment and the GLV microcontroller.
-
-The STM32G474 firmware then reads the 5 resulting frequency signals and reconstructs the temperatures:
-
-```
-[Segment 1–5 internal cell temperature average]
-  → existing cell sensor bus (inside HV segment, isolated domain)
-  → analog voltage output proportional to temperature
-  → V-to-F converter circuit (still in HV domain)
-  → isolation barrier (optocoupler/digital isolator)
-  → frequency pulse train in GLV domain
-  → STM32 Timer Input Capture + DMA (this firmware)
-  → frequency → voltage lookup table (1800–5450 Hz → 1.30–2.44V)
-  → voltage → temperature interpolation (−40°C to +120°C)
-  → UART output to vehicle data system
-```
-
-### FSAE Accumulator Rules Context (2026)
-
-- The AMS must monitor temperature of at least **30% of cells**, distributed evenly across all segments.
-- Each accumulator segment must be **galvanically isolated** from the chassis/GLV system (this firmware's whole reason for existing).
-- Segment voltage must remain ≤ 120V per segment; total TS voltage limits apply.
-- An IMD (Isolation Monitoring Device) must continuously verify isolation between TS and chassis.
-- The frequency-based isolation approach satisfies these rules by ensuring zero conductive path between HV segment and the STM32 reading the data.
+FSAE rules require galvanic isolation between each HV accumulator segment and the low-voltage (GLV) system. The solution: each segment's 16 NTC cell sensors are muxed to a V→F converter. The frequency signal crosses an optocoupler without any DC path, then the STM32 reads it via Timer Input Capture + DMA.
 
 ## Build
 
-The build system is GNU Make, managed by STM32CubeIDE. Build artifacts are generated in the `Debug/` directory.
+Build system: GNU Make via STM32CubeIDE. Artifacts go in `Debug/`.
 
 ```bash
-# Build (from repo root or Debug/)
-cd Debug && make all
-
-# Clean
-cd Debug && make clean
+cd Debug && make all    # build
+cd Debug && make clean  # clean
 ```
 
-**Outputs:** `Debug/TMS_CODE_V2.elf`, `.hex`, `.bin`, `.map`, `.list`
+**Outputs:** `Debug/TMS_V1.elf`, `.hex`, `.bin`, `.map`, `.list`
 
-**Toolchain:** `arm-none-eabi-gcc 13.3.rel1` with flags:
-- `-mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb`
-- `--specs=nano.specs --specs=nosys.specs`
+**Toolchain:** `arm-none-eabi-gcc 13.3.rel1`  
+Flags: `-mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb --specs=nano.specs --specs=nosys.specs`
 
-There is no formal test framework or lint tooling — this is bare-metal firmware validated via UART output and hardware observation.
+No test framework or lint tooling — validated via UART output and hardware observation.
 
 ## Flashing & Debugging
 
-Flash via STM32CubeIDE using the ST-Link probe and the included launch configuration (`TMS_CODE_V2 Debug.launch`). Command-line flashing requires OpenOCD + GDB.
+Flash via STM32CubeIDE with ST-Link probe. Command-line: OpenOCD + GDB.
 
 ## Architecture
 
-### Data Flow
+### Data Flow (per scan cycle, ~320 ms for 16 channels)
 
 ```
-Rising edges on 5 GPIO pins (PA0, PA1, PB15, PA11, PA8)
-  → TIM1/TIM2/TIM15 Input Capture
-  → DMA transfers capture timestamps
-  → HAL_TIM_IC_CaptureCallback() sets ready flag
-  → Main loop: frequency = 1_000_000 / timestamp_diff_µs
-  → Lookup table: frequency → voltage (1800–5450 Hz → 1.30–2.44V)
-  → Interpolation: voltage → temperature (−40°C to +120°C)
-  → UART output (115200 baud, 8N1)
+for ch = 0..15:
+  Drive MUX_S0–S3 (PB4–PB7) → selects cell ch on ALL 5 segments simultaneously
+  Wait MUX_SETTLE_MS (10 ms) for V-to-F output to stabilise
+  Start DMA Input Capture on 5 timer channels
+  Wait MUX_MEASURE_MS (2 ms) — captures 2 rising edges per channel
+  compute_frequency() → EMA filter → freq_to_voltage() → voltage_to_temp()
+
+After full 16-channel scan:
+  ComputeStats() → t_min, t_avg, t_max with open-wire exclusion
+  CAN_SendOrion2Data()  — 10 × 8-byte extended-ID frames to Orion 2 BMS
+  CAN_SendSummaryPacket() — 1 × 8-byte standard-ID frame to secondary MCU
+  USART2_Write() — one line per cell of segment 0 (debug, 115200 baud)
 ```
+
+### Key Implementation Details
+
+- **Frequency range:** 1829–5515 Hz → 1.30–2.44 V → −40°C to +120°C
+- **EMA filter:** α = 0.3 applied to raw frequency before conversion
+- **Open-wire detection:** `freq > FREQ_OPEN_WIRE_HZ (7000 Hz)` → immediate −999; `freq == 0` for `OPEN_WIRE_MISS_MAX (3)` consecutive scans → −999. Last valid reading preserved on recovery.
+- **Array sizing:** All segment arrays are `[MAX_SEGMENTS=5]` regardless of `NUM_SEGMENTS`. This is intentional — `process_segment()` is called for all 5 hardware channels unconditionally; using `[NUM_SEGMENTS]` caused a buffer overflow that corrupted `t_min`.
+- **TEST_MODE** (`#define TEST_MODE` in `main.c`): enables a TIM16 PWM generator on PA6 (AF1) producing a 50%-duty square wave. Jumper PA6 → segment input pin to validate the full pipeline without hardware. Change `test_freq_hz` via Live Expressions at runtime. Channel 14 of segment 0 is skipped in `ComputeStats()` while TEST_MODE is active.
+
+### CAN Output (FDCAN1, 500 kbps, PB8 RX / PB9 TX)
+
+**Orion 2 BMS** — 10 extended-ID frames (29-bit), base `0x1839F380`:
+- Msg 0–1: Seg 0 cells 0–7, 8–15; Msg 2–3: Seg 1 … Msg 8–9: Seg 4
+- Encoding: `data_byte = (uint8_t)(temp_°C + 40)`
+
+**Summary frame** — standard ID `0x100`:
+- `[T_min+40, min_cell, min_seg, T_avg+40, T_max+40, max_cell, max_seg, 0x00]`
+
+### Pin Mapping
+
+| Pin | Peripheral | Function |
+|-----|-----------|---------|
+| PA0 | TIM2 CH1 | Segment 0 V-to-F input |
+| PA1 | TIM2 CH2 | Segment 1 V-to-F input |
+| PB1 | TIM3 CH4 | Segment 2 V-to-F input |
+| PB11 | TIM2 CH4 | Segment 3 V-to-F input |
+| PA8 | TIM1 CH1 | Segment 4 V-to-F input |
+| PA2 | USART2 TX (AF7) | ST-Link VCP → PC |
+| PA6 | TIM16 CH1 (AF1) | TEST_MODE PWM output |
+| PB4–PB7 | GPIO_OUT | MUX S0–S3 address bus |
+| PB8–PB9 | FDCAN1 RX/TX (AF9) | CAN bus to Orion 2 BMS |
+
+### Timer Configuration
+
+Prescaler = 64−1 → 1 MHz timer clock (1 µs resolution) from 64 MHz HSI-PLL clock.  
+Frequency = `1_000_000 / (cap[1] − cap[0])` with 16-bit wrap-around handling (`TIMER_OVERFLOW = 65536`).
 
 ### Key Files
 
 | File | Role |
 |------|------|
-| `Core/Src/main.c` | All application logic: init, main loop, ISR callbacks |
-| `Core/Inc/main.h` | GPIO pin definitions and application constants |
-| `TMS_CODE_V2.ioc` | STM32CubeMX peripheral configuration (source of truth for HW config) |
-| `STM32G474RETX_FLASH.ld` | Linker script (512KB Flash @ 0x8000000, 128KB RAM @ 0x20000000) |
-| `Core/Inc/stm32g4xx_hal_conf.h` | Selects which HAL modules are compiled in |
-| `Drivers/STM32G4xx_HAL_Driver/` | ST-provided HAL — do not edit manually |
-
-### Pin Mapping
-
-| Pin | Timer Channel | Function |
-|-----|--------------|---------|
-| PA0 | TIM2 CH1 | Connection 1 |
-| PA1 | TIM2 CH2 | Connection 2 |
-| PB15 | TIM15 CH2 | Connection 3 |
-| PA11 | TIM1 CH4 | Connection 4 |
-| PA8 | TIM1 CH1 | Connection 5 |
-
-### Timer Configuration
-
-Prescaler = 63 → 1 MHz timer clock (1 µs resolution) from 64 MHz system clock. Frequency is computed as `1_000_000 / (capture2 - capture1)` in the ISR callback.
+| `Core/Src/main.c` | All application logic: init, scan loop, CAN/UART output, TEST_MODE |
+| `Core/Inc/main.h` | MUX and CAN pin defines |
+| `TMS_V1.ioc` | STM32CubeMX peripheral config (source of truth for HW) |
+| `Core/Src/stm32g4xx_hal_msp.c` | MSP callbacks: FDCAN1 clock + GPIO, DMA bindings |
+| `STM32G474RETX_FLASH.ld` | Linker script (512 KB Flash, 128 KB RAM) |
+| `Core/Inc/stm32g4xx_hal_conf.h` | Selects HAL modules compiled in |
 
 ## STM32CubeIDE Workflow
 
-1. Edit peripheral configuration in `TMS_CODE_V2.ioc` using the CubeMX visual editor.
+1. Edit peripherals in `TMS_V1.ioc` using the CubeMX visual editor.
 2. CubeMX regenerates `MX_*_Init()` functions in `main.c`.
-3. **User code must stay inside `/* USER CODE BEGIN */` / `/* USER CODE END */` blocks** — code outside these markers is overwritten on regeneration.
-4. Build and flash via STM32CubeIDE or command-line make.
+3. **All user code must stay inside `/* USER CODE BEGIN */` / `/* USER CODE END */` blocks** — anything outside is overwritten on regeneration.
+4. `FDCAN_Config()`, `USART2_Init()`, and all GPIO for MUX/CAN pins are in user-code blocks and survive regeneration.
 
 ## Enabled HAL Modules
 
-TIM, UART, GPIO, DMA, RCC, FLASH, PWR, CORTEX, EXTI. ADC, CAN, I2C, SPI, DAC, and RTC are disabled — do not enable them without updating `stm32g4xx_hal_conf.h` and the `.ioc` file.
+TIM, FDCAN, GPIO, DMA, RCC, FLASH, PWR, CORTEX, EXTI.  
+ADC, I2C, SPI, DAC, RTC are disabled — do not enable without updating `stm32g4xx_hal_conf.h` and the `.ioc`.
+
+## Bring-up vs. Full-pack
+
+`NUM_SEGMENTS` is currently `1` (single-segment bring-up). Change to `5` for full-pack operation. `MAX_SEGMENTS` must remain `5` — never reduce it.
